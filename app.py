@@ -12,12 +12,25 @@ from openpyxl.utils import get_column_letter
 import sqlite3
 from datetime import datetime
 import base64
+from supabase import create_client
+import json
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Supabase client
+supabase = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
+)
 
 # Page configuration
 st.set_page_config(
     page_title="Système de Gestion des QR Codes",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # Custom CSS
@@ -49,6 +62,36 @@ st.markdown("""
         border-radius: 5px;
         margin-bottom: 1rem;
     }
+    .data-box {
+        background-color: #ffffff;
+        padding: 1rem;
+        border-radius: 5px;
+        margin-bottom: 1rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .metric-box {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 5px;
+        margin: 0.5rem;
+        text-align: center;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2rem;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 4rem;
+        white-space: pre-wrap;
+        background-color: #f0f2f6;
+        border-radius: 4px 4px 0 0;
+        gap: 1rem;
+        padding-top: 10px;
+        padding-bottom: 10px;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #366092;
+        color: white;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -63,30 +106,30 @@ COLUMN_MAPPING = {
     "niveau": "niveau"
 }
 
-# Initialize database in session state
-if 'db_initialized' not in st.session_state:
-    st.session_state.db_initialized = False
+def get_all_records():
+    try:
+        response = supabase.table('emplacements').select("*").execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        st.error(f"Erreur lors de la récupération des données: {str(e)}")
+        return pd.DataFrame()
 
-def init_db():
-    if not st.session_state.db_initialized:
-        conn = sqlite3.connect('qr_codes.db')
-        c = conn.cursor()
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS emplacements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ph TEXT,
-                dtr TEXT,
-                nombre_planche INTEGER,
-                numero_planche INTEGER,
-                ligne TEXT,
-                position TEXT,
-                niveau TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
-        conn.close()
-        st.session_state.db_initialized = True
+def get_statistics(df):
+    if df.empty:
+        return {
+            "Total Records": 0,
+            "Unique PH": 0,
+            "Unique DTR": 0,
+            "Total Planches": 0
+        }
+    
+    stats = {
+        "Total Records": len(df),
+        "Unique PH": df['ph'].nunique(),
+        "Unique DTR": df['dtr'].nunique(),
+        "Total Planches": df['nombre_planche'].sum() if 'nombre_planche' in df.columns else 0
+    }
+    return stats
 
 def create_qr_code(data, filename, size=200):
     qr = qrcode.QRCode(
@@ -148,32 +191,45 @@ def create_excel_with_qr_codes(data, filename, is_emplacement=True):
     return filename
 
 def search_records(ph=None, dtr=None):
-    conn = sqlite3.connect('qr_codes.db')
-    query = "SELECT * FROM emplacements WHERE 1=1"
-    params = []
-    
-    if ph:
-        query += " AND ph LIKE ?"
-        params.append(f"%{ph}%")
-    if dtr:
-        query += " AND dtr LIKE ?"
-        params.append(f"%{dtr}%")
-    
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
+    try:
+        query = supabase.table('emplacements').select("*")
+        
+        if ph:
+            query = query.ilike('ph', f'%{ph}%')
+        if dtr:
+            query = query.ilike('dtr', f'%{dtr}%')
+            
+        response = query.execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        st.error(f"Erreur lors de la recherche: {str(e)}")
+        return pd.DataFrame()
 
-# Initialize database
-init_db()
+# Sidebar
+with st.sidebar:
+    st.image("https://img.icons8.com/color/96/000000/qr-code--v1.png", width=100)
+    st.markdown("## Menu")
+    st.markdown("---")
+    
+    # Quick stats in sidebar
+    try:
+        all_data = get_all_records()
+        if not all_data.empty:
+            stats = get_statistics(all_data)
+            st.markdown("### 📊 Statistiques rapides")
+            for key, value in stats.items():
+                st.metric(label=key, value=value)
+    except:
+        pass
 
 # Main title with custom styling
 st.markdown("<h1 style='text-align: center; color: #366092;'>Système de Gestion des QR Codes</h1>", unsafe_allow_html=True)
 
-# Create two columns for the layout
-col1, col2 = st.columns([1, 2])
+# Create tabs
+tab1, tab2, tab3 = st.tabs(["📤 Importation", "🔍 Recherche", "📊 Données"])
 
-with col1:
-    st.markdown("### 📤 Importation de données")
+with tab1:
+    st.markdown("### Importation de données")
     uploaded_file = st.file_uploader("Choisissez le fichier Excel d'entrée", type=['xlsx', 'xls'])
     
     if uploaded_file is not None:
@@ -189,10 +245,10 @@ with col1:
                 # Rename columns to match database schema
                 df = df.rename(columns=COLUMN_MAPPING)
                 
-                # Save to database
-                conn = sqlite3.connect('qr_codes.db')
-                df.to_sql('emplacements', conn, if_exists='append', index=False)
-                conn.close()
+                # Save to Supabase
+                for _, row in df.iterrows():
+                    data = row.to_dict()
+                    supabase.table('emplacements').insert(data).execute()
                 
                 st.success("Données importées avec succès!")
                 
@@ -224,21 +280,24 @@ with col1:
                 emplacement_file = create_excel_with_qr_codes(emplacement_data, "feuille_emplacement.xlsx", True)
                 planche_file = create_excel_with_qr_codes(planche_data, "feuille_planche.xlsx", False)
                 
-                with open(emplacement_file, 'rb') as f:
-                    st.download_button(
-                        label="📥 Télécharger fichier Emplacements",
-                        data=f,
-                        file_name="feuille_emplacement.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                col1, col2 = st.columns(2)
+                with col1:
+                    with open(emplacement_file, 'rb') as f:
+                        st.download_button(
+                            label="📥 Télécharger fichier Emplacements",
+                            data=f,
+                            file_name="feuille_emplacement.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
                 
-                with open(planche_file, 'rb') as f:
-                    st.download_button(
-                        label="📥 Télécharger fichier Planches",
-                        data=f,
-                        file_name="feuille_planche.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                with col2:
+                    with open(planche_file, 'rb') as f:
+                        st.download_button(
+                            label="📥 Télécharger fichier Planches",
+                            data=f,
+                            file_name="feuille_planche.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
                 
                 # Cleanup
                 for file in os.listdir(temp_dir):
@@ -250,8 +309,8 @@ with col1:
         except Exception as e:
             st.error(f"Erreur lors du traitement: {str(e)}")
 
-with col2:
-    st.markdown("### 🔍 Recherche")
+with tab2:
+    st.markdown("### Recherche de données")
     st.markdown('<div class="search-box">', unsafe_allow_html=True)
     
     search_col1, search_col2 = st.columns(2)
@@ -270,6 +329,38 @@ with col2:
             st.warning("Aucun résultat trouvé")
     
     st.markdown('</div>', unsafe_allow_html=True)
+
+with tab3:
+    st.markdown("### Visualisation des données")
+    
+    # Statistics section
+    st.markdown("#### 📊 Statistiques")
+    try:
+        all_data = get_all_records()
+        if not all_data.empty:
+            stats = get_statistics(all_data)
+            
+            # Display metrics in a grid
+            cols = st.columns(4)
+            for i, (key, value) in enumerate(stats.items()):
+                with cols[i % 4]:
+                    st.metric(label=key, value=value)
+            
+            # Data summary
+            st.markdown("#### 📋 Résumé des données")
+            st.markdown('<div class="data-box">', unsafe_allow_html=True)
+            st.dataframe(all_data.describe())
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Full data view
+            st.markdown("#### 📋 Toutes les données")
+            st.markdown('<div class="data-box">', unsafe_allow_html=True)
+            st.dataframe(all_data)
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.info("Aucune donnée disponible dans la base de données")
+    except Exception as e:
+        st.warning("Erreur lors de la récupération des données")
 
 # Footer
 st.markdown("---")
